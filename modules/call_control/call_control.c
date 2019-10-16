@@ -120,6 +120,7 @@ static void destroy(void);
 int parse_param_init(unsigned int type, void *val);
 int parse_param_start(unsigned int type, void *val);
 int parse_param_stop(unsigned int type, void *val);
+int parse_param_text(unsigned int type, void *val);
 
 /* Local global variables */
 static CallControlSocket callcontrol_socket = {
@@ -153,7 +154,7 @@ struct dlg_binds dlg_api;
 static int prepaid_account_flag = -1;
 static char *prepaid_account_str = 0;
 
-AVP_List *init_avps = NULL, *start_avps = NULL, *stop_avps = NULL;
+AVP_List *init_avps = NULL, *start_avps = NULL, *stop_avps = NULL, *text_avps = NULL;
 
 pv_elem_t *model;
 
@@ -166,6 +167,7 @@ static param_export_t parameters[] = {
     {"init",                    STR_PARAM|USE_FUNC_PARAM, (void*)parse_param_init},
     {"start",                   STR_PARAM|USE_FUNC_PARAM, (void*)parse_param_start},
     {"stop",                    STR_PARAM|USE_FUNC_PARAM, (void*)parse_param_stop},
+    {"text",                    STR_PARAM|USE_FUNC_PARAM, (void*)parse_param_text},
     {"disable",                 INT_PARAM, &disable},
     {"socket_name",             STR_PARAM, &(callcontrol_socket.name)},
     {"socket_timeout",          INT_PARAM, &(callcontrol_socket.timeout)},
@@ -214,7 +216,8 @@ struct module_exports exports = {
 typedef enum CallControlAction {
     CAInitialize = 1,
     CAStart,
-    CAStop
+    CAStop,
+    CAText
 } CallControlAction;
 
 
@@ -241,6 +244,7 @@ typedef struct CallInfo {
     str call_token;
     char* prepaid_account;
     int call_limit;
+    Bool text;
 } CallInfo;
 
 
@@ -350,6 +354,13 @@ parse_param_start(unsigned int type, void *val) {
 int
 parse_param_stop(unsigned int type, void *val) {
     if (parse_param(val, &stop_avps) == -1)
+        return E_CFG;
+    return 0;
+}
+
+int
+parse_param_text(unsigned int type, void *val) {
+    if (parse_param(val, &text_avps) == -1)
         return E_CFG;
     return 0;
 }
@@ -522,6 +533,9 @@ get_call_info(struct sip_msg *msg, CallControlAction action)
     case CAStop:
         headers = HDR_CALLID_F;
         break;
+    case CAText:
+        headers = HDR_CALLID_F|HDR_FROM_F;
+        break;
     default:
         // Invalid action. Should never get here.
         assert(False);
@@ -583,6 +597,12 @@ get_call_info(struct sip_msg *msg, CallControlAction action)
         }
     }
 
+    if (action == CAText) {
+        call_info.ruri = get_canonical_request_uri(msg);
+        call_info.diverter = get_diverter(msg);
+        call_info.source_ip = get_signaling_ip(msg);
+    }
+
     call_info.action = action;
 
     return &call_info;
@@ -605,6 +625,9 @@ make_custom_request(struct sip_msg *msg, CallInfo *call)
         break;
     case CAStop:
         al = stop_avps;
+        break;
+    case CAText:
+        al = text_avps;
         break;
     default:
         // should never get here, but keep gcc from complaining
@@ -696,6 +719,30 @@ make_default_request(CallInfo *call)
                        "callid: %.*s\r\n"
                        "\r\n",
                        call->callid.len, call->callid.s);
+
+        if (len >= sizeof(request)) {
+            LM_ERR("callcontrol request is longer than %ld bytes\n", (unsigned long)sizeof(request));
+            return NULL;
+        }
+
+        break;
+
+    case CAText:
+        len = snprintf(request, sizeof(request),
+                       "text\r\n"
+                       "ruri: %.*s\r\n"
+                       "diverter: %.*s\r\n"
+                       "sourceip: %.*s\r\n"
+                       "callid: %.*s\r\n"
+                       "from: %.*s\r\n"
+                       "fromtag: %.*s\r\n"
+                       "\r\n",
+                       call->ruri.len, call->ruri.s,
+                       call->diverter.len, call->diverter.s,
+                       call->source_ip.len, call->source_ip.s,
+                       call->callid.len, call->callid.s,
+                       call->from.len, call->from.s,
+                       call->from_tag.len, call->from_tag.s);
 
         if (len >= sizeof(request)) {
             LM_ERR("callcontrol request is longer than %ld bytes\n", (unsigned long)sizeof(request));
@@ -994,6 +1041,47 @@ call_control_stop(struct sip_msg *msg, str callid)
     }
 }
 
+// Text processing
+//
+
+// Return codes:
+//   1 - Allowed
+//  -1 - No credit
+//  -5 - Internal error (message parsing, communication, ...)
+static int
+call_control_text(struct sip_msg *msg)
+{
+    CallInfo *call;
+    char *message, *result = NULL;
+
+
+    call = get_call_info(msg, CAText);
+    if (!call) {
+        LM_ERR("can't retrieve text info\n");
+        return -5;
+    }
+
+
+    if (!text_avps)
+        message = make_default_request(call);
+    else
+        message = make_custom_request(msg, call);
+
+    if (!message)
+        return -5;
+
+   result = send_command(message);
+
+    if (result==NULL) {
+        return -5;
+    } else if (strcasecmp(result, "Allowed\r\n")==0) {
+        return 1;
+    } else if (strcasecmp(result, "No credit\r\n")==0) {
+        return -1;
+    } else {
+        return -5;
+    }
+}
 
 // Dialog callbacks and helpers
 //
@@ -1040,7 +1128,7 @@ __dialog_loaded(struct dlg_cell *dlg, int type, struct dlg_cb_params *_params)
 
 // Return codes:
 //   2 - No limit
-//   1 - Limited
+//   1 - Limited/Allowed
 //  -1 - No credit
 //  -2 - Locked
 //  -3 - Duplicated callid
@@ -1056,10 +1144,13 @@ CallControl(struct sip_msg *msg, char *str1, char *str2)
     if (disable)
         return 2;
 
-    if (msg->first_line.type!=SIP_REQUEST || msg->REQ_METHOD!=METHOD_INVITE || has_to_tag(msg)) {
+    if (msg->first_line.type!=SIP_REQUEST || (msg->REQ_METHOD!=METHOD_INVITE && msg->REQ_METHOD!=METHOD_MESSAGE) || has_to_tag(msg)) {
         LM_WARN("call_control should only be called for the first INVITE\n");
         return -5;
     }
+    
+    if(msg->REQ_METHOD==METHOD_MESSAGE)
+        return call_control_text(msg);
 
     result = call_control_initialize(msg);
     if (result == 1) {
@@ -1228,6 +1319,9 @@ destroy(void) {
         destroy_list(start_avps);
 
     if (stop_avps)
+        destroy_list(stop_avps);
+
+    if (text_avps)
         destroy_list(stop_avps);
 }
 
